@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME 4100901-Control_Access_System)
+set(CMAKE_PROJECT_NAME Project)
 
 # Include toolchain file
 include("cmake/gcc-arm-none-eabi.cmake")
@@ -47,16 +47,19 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    # Add user sources here
+    Drivers/keypad/keypad.c
     Core/Src/ring_buffer.c
     Drivers/ssd1306/ssd1306.c
     Drivers/ssd1306/ssd1306_fonts.c
-    # Add user sources here
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    Drivers/ssd1306
     # Add user defined include paths
+    Drivers/keypad
+    Drivers/ssd1306
+    Assets
 )
 
 # Add project symbols (macros)
