@@ -3,7 +3,7 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : Main program body with updated command, timer, LED ring,
-  *                   OLED bitmap display logic, and sleep mode functionality.
+  *                   and OLED bitmap display logic.
   ******************************************************************************
   * @attention
   *
@@ -78,10 +78,6 @@ uint32_t last_button_press_time = 0;
 uint32_t debounce_tick = 0;
 uint32_t button_debounce_tick = 0;
 
-/* --- New globals for sleep/inactivity and mistakes --- */
-uint32_t last_activity_tick = 0;    // updated on every activity (button or UART)
-uint8_t mistake_count = 0;          // counts invalid (unrecognized) commands
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,7 +99,6 @@ static void MX_I2C1_Init(void);
 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   uint32_t current_tick = HAL_GetTick();
-  last_activity_tick = current_tick;  // any external interrupt resets inactivity timer
   if (GPIO_Pin == B1_Pin) {
     if ((current_tick - button_debounce_tick) < 200) {
       return;
@@ -146,8 +141,6 @@ uint8_t cmd_index = 0;
 
 /* --- UART Receive Callback --- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-  uint32_t current_tick = HAL_GetTick();
-  last_activity_tick = current_tick;  // activity detected from UART
   if (huart == &huart2) {
     ring_buffer_write(&rx_buffer, byte_received_uart2);
     HAL_UART_Transmit(&huart3, &byte_received_uart2, 1, 10);
@@ -157,31 +150,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
     HAL_UART_Transmit(&huart2, &byte_received_uart3, 1, 10);
     HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
   }
-}
-
-/* --- Sleep mode functions --- */
-/* Inactivity sleep: if no activity for 30 sec, go to sleep until an interrupt wakes up */
-void sleep_mode_inactivity(void) {
-  uart_send_string("\r\nNo activity for 30 sec. Entering sleep mode.\r\n");
-  HAL_SuspendTick();
-  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-  HAL_ResumeTick();
-  uart_send_string("\r\nAwake from inactivity sleep.\r\n");
-  last_activity_tick = HAL_GetTick();
-}
-
-/* Mistake sleep: if 5 invalid commands in a row, sleep for 10 sec */
-void sleep_mode_mistake(void) {
-  uart_send_string("\r\nToo many invalid commands. Sleeping for 10 sec.\r\n");
-  HAL_SuspendTick();
-  uint32_t sleepStart = HAL_GetTick();
-  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-  // Ensure at least 10 sec pass before resuming
-  while(HAL_GetTick() - sleepStart < 10000) { }
-  HAL_ResumeTick();
-  uart_send_string("\r\nAwake from mistake sleep.\r\n");
-  mistake_count = 0;
-  last_activity_tick = HAL_GetTick();
 }
 
 /* --- Command processor --- */
@@ -195,7 +163,6 @@ void process_commands(void) {
       start = 1;
       uart_send_string("\r\nCommand mode activated. Send commands.\r\n");
       memset(current_cmd, 0, COMMAND_LENGTH);
-      mistake_count = 0;  // reset mistakes on valid start
     }
 
     if (start) {
@@ -205,7 +172,6 @@ void process_commands(void) {
         temp_open_start = HAL_GetTick();
         uart_send_string("\r\nDoor opened temporarily (5 sec).\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
-        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_CLOSE, COMMAND_LENGTH) == 0) {
         HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
@@ -213,13 +179,11 @@ void process_commands(void) {
         temp_open_start = 0;
         uart_send_string("\r\nDoor closed.\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
-        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_STATUS, COMMAND_LENGTH) == 0) {
         uint8_t state = HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin);
         uart_send_string(state ? "\r\nStatus: OPEN\r\n" : "\r\nStatus: CLOSED\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
-        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_RESET, COMMAND_LENGTH) == 0) {
         HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
@@ -228,23 +192,12 @@ void process_commands(void) {
         temp_open_start = 0;
         uart_send_string("\r\nSystem reset.\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
-        mistake_count = 0;
       }
-      /* If the command buffer is nonempty (i.e. 5 characters have been received)
-         and does not match any valid command, count as an invalid command.
-         (This check is done only once per full command block.)
-      */
       else {
-        /* If current_cmd is not all zeros, assume it is a full but invalid command */
+        /* If current_cmd is nonzero and invalid, send an error message */
         if (current_cmd[0] != 0) {
-          mistake_count++;
-          char msg[50];
-          sprintf(msg, "\r\nInvalid command. %d tries remaining until sleep.\r\n", 5 - mistake_count);
-          uart_send_string(msg);
+          uart_send_string("\r\nInvalid command.\r\n");
           memset(current_cmd, 0, COMMAND_LENGTH);
-          if (mistake_count >= 5) {
-            sleep_mode_mistake();
-          }
         }
       }
     }
@@ -290,8 +243,6 @@ int main(void)
   keypad_init();
   ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));
   memset(current_cmd, 0, COMMAND_LENGTH);
-  /* Initialize last_activity_tick to current time */
-  last_activity_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Start UART reception interrupts */
@@ -311,11 +262,6 @@ int main(void)
   while (1)
   {
     heartbeat();
-
-    /* Check inactivity sleep: if no activity for 30 sec, enter sleep mode */
-    if (HAL_GetTick() - last_activity_tick >= 30000) {
-      sleep_mode_inactivity();
-    }
 
     /* Handle keypad column if needed */
     if (column_pressed != 0 && (key_pressed_tick + 5) < HAL_GetTick()) {
