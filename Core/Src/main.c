@@ -3,7 +3,7 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : Main program body with updated command, timer, LED ring,
-  *                   and OLED bitmap display logic.
+  *                   OLED bitmap display logic, and sleep mode functionality.
   ******************************************************************************
   * @attention
   *
@@ -31,10 +31,7 @@
 #include "ring.h"
 #include "locked.h"
 #include "unlocked.h"
-/* 
-   It is assumed that the following bitmaps are defined in another file.
-   Their dimensions are assumed to be 128x64 (for full screen) – adjust as needed.
-*/
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -77,8 +74,10 @@ uint8_t button_press_count = 0;
 uint32_t last_button_press_time = 0;
 uint32_t debounce_tick = 0;
 uint32_t button_debounce_tick = 0;
-uint32_t last_activity_tick = 0;    
-uint8_t mistake_count = 0;
+
+/* --- New globals for sleep/inactivity and mistakes --- */
+uint32_t last_activity_tick = 0;    // updated on every activity (button or UART)
+uint8_t mistake_count = 0;          // counts invalid (unrecognized) commands
 
 /* USER CODE END PV */
 
@@ -95,13 +94,10 @@ static void MX_I2C1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* --- EXTI Callback updated to handle B1 and B2 ---
-     B1: door control (counts presses for temporary/permanent open)
-     B2: ring control – no action here (polled later)
-*/
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   uint32_t current_tick = HAL_GetTick();
-  last_activity_tick = current_tick;
+  last_activity_tick = current_tick;  // any external interrupt resets inactivity timer
   if (GPIO_Pin == B1_Pin) {
     if ((current_tick - button_debounce_tick) < 200) {
       return;
@@ -123,19 +119,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   }
 }
 
-/* --- Command definitions (all 5 characters) ---
-     CMD_START:      activates command mode
-     CMD_TEMP_OPEN:  open door temporarily (5 sec)
-     CMD_CLOSE:      close door
-     CMD_STATUS:     report door status
-     CMD_RESET:      reset system state
-*/
-#define COMMAND_LENGTH 5
-const char CMD_START[]     = "#*#*#";
-const char CMD_TEMP_OPEN[] = "#*A*#";   // Temporary open command (5 sec)
-const char CMD_CLOSE[]     = "#*C*#";   // Close command
-const char CMD_STATUS[]    = "#*1*#";   // Status command
-const char CMD_RESET[]     = "#*0*#";   // Reset command
+
+#define COMMAND_LENGTH 3
+const char CMD_START[]     = "#*#";
+const char CMD_TEMP_OPEN[] = "#0#";   // Temporary open command (5 sec)
+const char CMD_CLOSE[]     = "#C#";   // Close command
+const char CMD_STATUS[]    = "#1#";   // Status command
+const char CMD_RESET[]     = "#8#";   // Reset command
 
 ring_buffer_t rx_buffer;
 uint8_t rx_buffer_mem[64];
@@ -145,7 +135,7 @@ uint8_t cmd_index = 0;
 /* --- UART Receive Callback --- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
   uint32_t current_tick = HAL_GetTick();
-  last_activity_tick = current_tick; 
+  last_activity_tick = current_tick;  // activity detected from UART
   if (huart == &huart2) {
     ring_buffer_write(&rx_buffer, byte_received_uart2);
     HAL_UART_Transmit(&huart3, &byte_received_uart2, 1, 10);
@@ -157,18 +147,43 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
   }
 }
 
-/* --- Command processor --- */
+
+void sleep_mode_inactivity(void) {
+  uart_send_string("\r\nNo activity for 30 sec. Entering sleep mode.\r\n");
+  HAL_SuspendTick();
+  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  HAL_ResumeTick();
+  uart_send_string("\r\nAwake from inactivity sleep.\r\n");
+  last_activity_tick = HAL_GetTick();
+}
+
+
+void sleep_mode_mistake(void) {
+  uart_send_string("\r\nToo many invalid commands. Sleeping for 10 sec.\r\n");
+  HAL_SuspendTick();
+  uint32_t sleepStart = HAL_GetTick();
+  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  // Ensure at least 10 sec pass before resuming
+  while(HAL_GetTick() - sleepStart < 10000) { }
+  HAL_ResumeTick();
+  uart_send_string("\r\nAwake from mistake sleep.\r\n");
+  mistake_count = 0;
+  last_activity_tick = HAL_GetTick();
+}
+
+
 void process_commands(void) {
   uint8_t byte;
+  
   while (ring_buffer_read(&rx_buffer, &byte)) {
     memmove(current_cmd, current_cmd + 1, COMMAND_LENGTH - 1);
     current_cmd[COMMAND_LENGTH - 1] = (char)byte;
 
     if (memcmp(current_cmd, CMD_START, COMMAND_LENGTH) == 0) {
       start = 1;
-      uart_send_string("\r\nCommand mode activated. Send commands.\r\n");
+      uart_send_string("\r\nInput key : Correct.\r\n");
       memset(current_cmd, 0, COMMAND_LENGTH);
-      mistake_count = 0;  // Reset mistake counter on valid start
+      mistake_count = 0;  // reset mistakes on valid start
     }
 
     if (start) {
@@ -203,7 +218,9 @@ void process_commands(void) {
         memset(current_cmd, 0, COMMAND_LENGTH);
         mistake_count = 0;
       }
+
       else {
+
         if (current_cmd[0] != 0) {
           mistake_count++;
           char msg[50];
@@ -219,13 +236,13 @@ void process_commands(void) {
   }
 }
 
-/* --- Helper function to send strings via UART --- */
+
 void uart_send_string(const char *str) {
   HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
   HAL_UART_Transmit(&huart3, (uint8_t *)str, strlen(str), 100);
 }
 
-/* --- Heartbeat function to toggle LD2 --- */
+
 void heartbeat(void)
 {
   static uint32_t last_tick = 0;
@@ -245,12 +262,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  ssd1306_Init();
-  ssd1306_Fill(Black);
-  ssd1306_UpdateScreen();
-  keypad_init();
-  ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));
-  memset(current_cmd, 0, COMMAND_LENGTH);
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -275,6 +287,17 @@ int main(void)
   MX_USART3_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_UpdateScreen();
+  keypad_init();
+  ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));
+  memset(current_cmd, 0, COMMAND_LENGTH);
+  last_activity_tick = HAL_GetTick();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   HAL_UART_Receive_IT(&huart2, &byte_received_uart2, 1);
   HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
   HAL_UART_Transmit(&huart2, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
@@ -284,21 +307,17 @@ int main(void)
   ssd1306_WriteString((char *)FW_VERSION, Font_7x10, White);
   ssd1306_UpdateScreen();
 
-  /* Variables for ring LED toggling and B2 state tracking */
   static uint32_t last_blink_tick = 0;
   static uint8_t prev_b2_state = 0;
-  /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
     heartbeat();
+
     if (HAL_GetTick() - last_activity_tick >= 30000) {
       sleep_mode_inactivity();
     }
 
-    /* Handle keypad column if needed */
     if (column_pressed != 0 && (key_pressed_tick + 5) < HAL_GetTick()) {
       uint8_t key = keypad_scan(column_pressed);
       ring_buffer_write(&rx_buffer, key);
@@ -356,31 +375,29 @@ int main(void)
                  > If the door (LD4) is ON, display the "unlocked" bitmap.
                  > Otherwise, display the "locked" bitmap.
     */
-    uint8_t current_b2_state = HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
-    if (current_b2_state == GPIO_PIN_SET) {
+   uint8_t current_b2_state = HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
+  if (current_b2_state == GPIO_PIN_RESET) {  // Button pressed (active low)
       if (!prev_b2_state) {
-        uart_send_string("\r\nRing pressed.\r\n");
+          uart_send_string("\r\nRing pressed.\r\n");
       }
-      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
+      // Turn the LED ON when the button is pressed.
+      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_SET);
       ssd1306_Fill(Black);
       ssd1306_DrawBitmap(0, 0, ring, 128, 64, White);
       ssd1306_UpdateScreen();
       prev_b2_state = 1;
-    } else {
-      if ((HAL_GetTick() - last_blink_tick) >= 250) {
-         last_blink_tick = HAL_GetTick();
-         HAL_GPIO_TogglePin(LD5_GPIO_Port, LD5_Pin);
-      }
+  } else {
+      // Turn the LED OFF when the button is not pressed.
+      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
       ssd1306_Fill(Black);
       if (HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin) == GPIO_PIN_SET) {
-         ssd1306_DrawBitmap(0, 0, unlocked, 128, 64, White);
+        ssd1306_DrawBitmap(0, 0, unlocked, 128, 64, White);
       } else {
-         ssd1306_DrawBitmap(0, 0, locked, 128, 64, White);
+        ssd1306_DrawBitmap(0, 0, locked, 128, 64, White);
       }
       ssd1306_UpdateScreen();
       prev_b2_state = 0;
-    }
-
+  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -586,7 +603,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : B2_Pin */
   GPIO_InitStruct.Pin = B2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B2_GPIO_Port, &GPIO_InitStruct);
 
@@ -644,29 +661,7 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void sleep_mode_inactivity(void)
-{
-    uart_send_string("\r\nNo activity for 30 sec. Entering sleep mode.\r\n");
-    HAL_SuspendTick();
-    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-    HAL_ResumeTick();
-    uart_send_string("\r\nAwake from inactivity sleep.\r\n");
-    last_activity_tick = HAL_GetTick();
-}
 
-void sleep_mode_mistake(void)
-{
-    uart_send_string("\r\nToo many invalid commands. Sleeping for 10 sec.\r\n");
-    HAL_SuspendTick();
-    uint32_t sleepStart = HAL_GetTick();
-    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-    // Wait until 10 sec pass
-    while(HAL_GetTick() - sleepStart < 10000) { }
-    HAL_ResumeTick();
-    uart_send_string("\r\nAwake from mistake sleep.\r\n");
-    mistake_count = 0;
-    last_activity_tick = HAL_GetTick();
-}
 /* USER CODE END 4 */
 
 /**
