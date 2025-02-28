@@ -17,10 +17,10 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
+/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "keypad.h"
 #include "ring_buffer.h"
@@ -77,6 +77,8 @@ uint8_t button_press_count = 0;
 uint32_t last_button_press_time = 0;
 uint32_t debounce_tick = 0;
 uint32_t button_debounce_tick = 0;
+uint32_t last_activity_tick = 0;    
+uint8_t mistake_count = 0;
 
 /* USER CODE END PV */
 
@@ -99,6 +101,7 @@ static void MX_I2C1_Init(void);
 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   uint32_t current_tick = HAL_GetTick();
+  last_activity_tick = current_tick;
   if (GPIO_Pin == B1_Pin) {
     if ((current_tick - button_debounce_tick) < 200) {
       return;
@@ -141,6 +144,8 @@ uint8_t cmd_index = 0;
 
 /* --- UART Receive Callback --- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+  uint32_t current_tick = HAL_GetTick();
+  last_activity_tick = current_tick; 
   if (huart == &huart2) {
     ring_buffer_write(&rx_buffer, byte_received_uart2);
     HAL_UART_Transmit(&huart3, &byte_received_uart2, 1, 10);
@@ -163,6 +168,7 @@ void process_commands(void) {
       start = 1;
       uart_send_string("\r\nCommand mode activated. Send commands.\r\n");
       memset(current_cmd, 0, COMMAND_LENGTH);
+      mistake_count = 0;  // Reset mistake counter on valid start
     }
 
     if (start) {
@@ -172,6 +178,7 @@ void process_commands(void) {
         temp_open_start = HAL_GetTick();
         uart_send_string("\r\nDoor opened temporarily (5 sec).\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_CLOSE, COMMAND_LENGTH) == 0) {
         HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
@@ -179,11 +186,13 @@ void process_commands(void) {
         temp_open_start = 0;
         uart_send_string("\r\nDoor closed.\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_STATUS, COMMAND_LENGTH) == 0) {
         uint8_t state = HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin);
         uart_send_string(state ? "\r\nStatus: OPEN\r\n" : "\r\nStatus: CLOSED\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
       }
       else if (memcmp(current_cmd, CMD_RESET, COMMAND_LENGTH) == 0) {
         HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
@@ -192,12 +201,18 @@ void process_commands(void) {
         temp_open_start = 0;
         uart_send_string("\r\nSystem reset.\r\n");
         memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
       }
       else {
-        /* If current_cmd is nonzero and invalid, send an error message */
         if (current_cmd[0] != 0) {
-          uart_send_string("\r\nInvalid command.\r\n");
+          mistake_count++;
+          char msg[50];
+          sprintf(msg, "\r\nInvalid command. %d tries remaining until sleep.\r\n", 5 - mistake_count);
+          uart_send_string(msg);
           memset(current_cmd, 0, COMMAND_LENGTH);
+          if (mistake_count >= 5) {
+            sleep_mode_mistake();
+          }
         }
       }
     }
@@ -228,24 +243,38 @@ void heartbeat(void)
   */
 int main(void)
 {
-  /* MCU Configuration--------------------------------------------------------*/
-  HAL_Init();
-  SystemClock_Config();
-  MX_GPIO_Init();
-  MX_USART2_UART_Init();
-  MX_USART3_UART_Init();
-  MX_I2C1_Init();
 
-  /* USER CODE BEGIN 2 */
+  /* USER CODE BEGIN 1 */
   ssd1306_Init();
   ssd1306_Fill(Black);
   ssd1306_UpdateScreen();
   keypad_init();
   ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));
   memset(current_cmd, 0, COMMAND_LENGTH);
-  /* USER CODE END 2 */
+  /* USER CODE END 1 */
 
-  /* Start UART reception interrupts */
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
+  MX_I2C1_Init();
+  /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart2, &byte_received_uart2, 1);
   HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
   HAL_UART_Transmit(&huart2, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
@@ -258,10 +287,16 @@ int main(void)
   /* Variables for ring LED toggling and B2 state tracking */
   static uint32_t last_blink_tick = 0;
   static uint8_t prev_b2_state = 0;
+  /* USER CODE END 2 */
 
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
     heartbeat();
+    if (HAL_GetTick() - last_activity_tick >= 30000) {
+      sleep_mode_inactivity();
+    }
 
     /* Handle keypad column if needed */
     if (column_pressed != 0 && (key_pressed_tick + 5) < HAL_GetTick()) {
@@ -345,19 +380,33 @@ int main(void)
       ssd1306_UpdateScreen();
       prev_b2_state = 0;
     }
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
+  /* USER CODE END 3 */
 }
 
-/* System Clock Configuration */
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+  /** Configure the main internal regulator output voltage
+  */
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
   {
     Error_Handler();
   }
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -372,21 +421,37 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
-/* I2C1 Initialization Function */
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.Timing = 0x10D19CE4;
   hi2c1.Init.OwnAddress1 = 0;
@@ -400,19 +465,41 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
+
+  /** Configure Analogue filter
+  */
   if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
+
+  /** Configure Digital filter
+  */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
-/* USART2 Initialization Function */
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART2_UART_Init(void)
 {
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -427,11 +514,27 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
 }
 
-/* USART3 Initialization Function */
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART3_UART_Init(void)
 {
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -446,12 +549,22 @@ static void MX_USART3_UART_Init(void)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
 }
 
-/* GPIO Initialization Function */
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -459,66 +572,102 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /* Configure output pins for LD4, LD2, LD5, ROW_1 */
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, LD4_Pin|LD2_Pin|LD5_Pin|ROW_1_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, ROW_2_Pin|ROW_4_Pin|ROW_3_Pin, GPIO_PIN_RESET);
 
-  /* Configure B1 */
+  /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /* Configure B2 */
+  /*Configure GPIO pin : B2_Pin */
   GPIO_InitStruct.Pin = B2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B2_GPIO_Port, &GPIO_InitStruct);
 
-  /* Configure output pins for LD4, LD2, LD5 */
+  /*Configure GPIO pins : LD4_Pin LD2_Pin LD5_Pin */
   GPIO_InitStruct.Pin = LD4_Pin|LD2_Pin|LD5_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Configure keypad columns */
+  /*Configure GPIO pin : COLUMN_1_Pin */
   GPIO_InitStruct.Pin = COLUMN_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(COLUMN_1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : COLUMN_4_Pin */
   GPIO_InitStruct.Pin = COLUMN_4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(COLUMN_4_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : COLUMN_2_Pin COLUMN_3_Pin */
   GPIO_InitStruct.Pin = COLUMN_2_Pin|COLUMN_3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Configure keypad rows */
+  /*Configure GPIO pin : ROW_1_Pin */
   GPIO_InitStruct.Pin = ROW_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(ROW_1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : ROW_2_Pin ROW_4_Pin ROW_3_Pin */
   GPIO_InitStruct.Pin = ROW_2_Pin|ROW_4_Pin|ROW_3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* EXTI interrupt init */
+  /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
 }
+
+/* USER CODE BEGIN 4 */
+void sleep_mode_inactivity(void)
+{
+    uart_send_string("\r\nNo activity for 30 sec. Entering sleep mode.\r\n");
+    HAL_SuspendTick();
+    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    HAL_ResumeTick();
+    uart_send_string("\r\nAwake from inactivity sleep.\r\n");
+    last_activity_tick = HAL_GetTick();
+}
+
+void sleep_mode_mistake(void)
+{
+    uart_send_string("\r\nToo many invalid commands. Sleeping for 10 sec.\r\n");
+    HAL_SuspendTick();
+    uint32_t sleepStart = HAL_GetTick();
+    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    // Wait until 10 sec pass
+    while(HAL_GetTick() - sleepStart < 10000) { }
+    HAL_ResumeTick();
+    uart_send_string("\r\nAwake from mistake sleep.\r\n");
+    mistake_count = 0;
+    last_activity_tick = HAL_GetTick();
+}
+/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -526,14 +675,28 @@ static void MX_GPIO_Init(void)
   */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
+  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
