@@ -99,7 +99,8 @@ void Error_Handler(void);
 #define ROW_3_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/* Helper function to send strings over UART */
+void uart_send_string(const char *str);
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

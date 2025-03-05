@@ -2,38 +2,33 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body with updated command, timer, LED ring,
-  *                   OLED bitmap display logic, and sleep mode functionality.
+  * @brief          : Main program body.
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * (CubeMX generated code – do not change)
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "buffer_manager.h"
-#include "state_machine.h"
 #include "keypad.h"
+#include "ring_buffer.h"
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+#include "command_handler.h"
+#include "button_handler.h"
+#include "door_controller.h"
 #include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// (None moved here – user typedefs now in libraries as needed)
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -43,7 +38,6 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -53,9 +47,26 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+uint8_t rx_byte;
 
-/* --- For button debouncing and tracking --- */
+/* --- Global variable for last activity --- */
+uint32_t last_activity_tick;
 
+/* --- Ring buffers for different interfaces --- */
+ring_buffer_t rx_buffer;                // UART2
+uint8_t rx_buffer_mem[64];
+
+ring_buffer_t rx_buffer_uart3;          // UART3
+uint8_t rx_buffer_uart3_mem[64];
+
+ring_buffer_t rx_buffer_keypad;         // Keypad input
+uint8_t rx_buffer_keypad_mem[64];
+
+/* --- Command buffers for each interface (3-byte command) --- */
+#define COMMAND_LENGTH 3
+char current_cmd_uart2[COMMAND_LENGTH] = {0};
+char current_cmd_uart3[COMMAND_LENGTH] = {0};
+char current_cmd_keypad[COMMAND_LENGTH] = {0};
 
 /* USER CODE END PV */
 
@@ -66,31 +77,44 @@ static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-
+/* --- Override external interrupt callback to delegate to button_handler --- */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-  StateMachine_GPIO_Callback(GPIO_Pin);
+  button_handler_exti_callback(GPIO_Pin);
 }
-
 
 /* --- UART Receive Callback --- */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART2) {
-        static uint8_t byte_received_uart2;
-        StateMachine_UART_RxCplt(huart, byte_received_uart2);
-    } else if (huart->Instance == USART3) {
-        static uint8_t byte_received_uart3;
-        StateMachine_UART_RxCplt(huart, byte_received_uart3);
-    }
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+  last_activity_tick = HAL_GetTick();  // any UART activity resets inactivity timer
+
+  if (huart == &huart2) {
+    ring_buffer_write(&rx_buffer, rx_byte);
+    HAL_UART_Transmit(&huart3, &rx_byte, 1, 10);
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+  } else if (huart == &huart3) {
+    ring_buffer_write(&rx_buffer_uart3, rx_byte);
+    HAL_UART_Transmit(&huart2, &rx_byte, 1, 10);
+    HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
+  }
 }
 
-
+/* --- Heartbeat LED toggle (remains in main) --- */
+void heartbeat(void)
+{
+  static uint32_t last_tick = 0;
+  if ((last_tick + 500) < HAL_GetTick()) {
+    last_tick = HAL_GetTick();
+    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+  }
+}
+void uart_send_string(const char *str) {
+  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
+  HAL_UART_Transmit(&huart3, (uint8_t *)str, strlen(str), 100);
+}
 
 /* USER CODE END 0 */
 
@@ -102,7 +126,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -127,33 +150,59 @@ int main(void)
   MX_USART3_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
- 
   ssd1306_Init();
   ssd1306_Fill(Black);
   ssd1306_UpdateScreen();
   keypad_init();
-  BufferManager_Init();
-  StateMachine_Init();
+  
+  /* Initialize ring buffers for each interface */
+  ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));                     // UART2
+  ring_buffer_init(&rx_buffer_uart3, rx_buffer_uart3_mem, sizeof(rx_buffer_uart3_mem));       // UART3
+  ring_buffer_init(&rx_buffer_keypad, rx_buffer_keypad_mem, sizeof(rx_buffer_keypad_mem));     // Keypad
+  
+  memset(current_cmd_uart2, 0, COMMAND_LENGTH);
+  memset(current_cmd_uart3, 0, COMMAND_LENGTH);
+  memset(current_cmd_keypad, 0, COMMAND_LENGTH);
+  
+  last_activity_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  HAL_UART_Receive_IT(&huart2, (uint8_t *)NULL, 1);  // Actual byte is handled in callback
-    HAL_UART_Receive_IT(&huart3, (uint8_t *)NULL, 1);
-  HAL_UART_Transmit(&huart2, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
-  HAL_UART_Transmit(&huart3, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
-
-  ssd1306_SetCursor(20, 20);
-  ssd1306_WriteString((char *)FW_VERSION, Font_7x10, White);
-  ssd1306_UpdateScreen();
-
   while (1)
   {
-    
-    StateMachine_Update();
-    
     /* USER CODE END WHILE */
+    heartbeat();
 
+    /* Check for inactivity (30 sec) */
+    if (HAL_GetTick() - last_activity_tick >= 30000) {
+      sleep_mode_inactivity();
+    }
+
+    /* Process keypad external interrupts.
+       Retrieve the column from the button_handler (set in the EXTI callback)
+       and if a key is available, scan and write it to the keypad ring buffer. */
+    uint16_t col = button_handler_get_column();
+    if (col != 0) {
+      uint8_t key = keypad_scan(col);
+      ring_buffer_write(&rx_buffer_keypad, key);
+      HAL_UART_Transmit(&huart2, &key, 1, 100);
+      HAL_UART_Transmit(&huart3, &key, 1, 100);
+    }
+    
+    /* Process commands from all three interfaces */
+    process_all_commands(&rx_buffer, current_cmd_uart2,
+                         &rx_buffer_uart3, current_cmd_uart3,
+                         &rx_buffer_keypad, current_cmd_keypad);
+
+    /* Process B1 button actions (single/double press for door control) */
+    button_handler_process();
+
+    /* Auto-close the door after 5 seconds if open temporarily */
+    door_controller_auto_close_check();
+    
+    /* Process ring button (B2) and update OLED display */
+    button_handler_process_ring();
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -415,7 +464,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
 /* USER CODE END 4 */
 
 /**
