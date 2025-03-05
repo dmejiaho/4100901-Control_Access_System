@@ -109,5 +109,102 @@ La pantalla **OLED** proporciona retroalimentación visual en tiempo real:
 - Al iniciar, se muestra la versión del firmware en la salida **UART**.
 
 ---
+## Diagrama 1: Arquitectura General del Código
+```plaintext
+┌───────────────────────────────────────┐
+│   main.c (inicialización, bucle       │
+│   principal, etc.)                     │
+└─────────────────┬──────────────────────┘
+                  │
+                  │ (Interrupciones)
+                  │  HAL_GPIO_EXTI_Callback
+                  │  HAL_UART_RxCpltCallback
+                  ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  button_handler.c                            │
+│   (Gestión de EXTI: B1/B2, debouncing, pulsación simple/doble, │
+│    control del anillo OLED, etc.)                              │
+└───────────────┬──────────────────────────────────────────────┘
+                │ (Eventos de botón)
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│         ring_buffer.c (UART2, UART3, Keypad)                     │
+│  (Buffers circulares donde se almacenan los bytes recibidos por    │
+│   interrupción. Se leen en el bucle principal.)                   │
+└───────────────┬────────────────────────────────────────────────┘
+                │ (Lectura y escritura de datos)
+                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                command_handler.c                             │
+│ (Máquina de estados para comandos: #*#, #0#, #C#, #1#, #8#,    │
+│  etc. Lógica de STATE_WAIT_FOR_START / STATE_WAIT_FOR_COMMAND,  │
+│  control de errores y sleep, envío de strings.)                │
+└───────────────┬──────────────────────────────────────────────┘
+                │ (Comandos reconocidos)
+                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  door_controller.c                           │
+│ (Funciones para abrir/cerrar la puerta: LD4, temporizada,      │
+│  permanente, auto-cierre tras 5 s, etc.)                       │
+└──────────────────────────────────────────────────────────────┘
+```
+## Notas:
 
+main.c inicializa los periféricos (GPIO, UART, I2C) mediante el código autogenerado por CubeMX y ejecuta el bucle principal.
+
+Las interrupciones (pulsaciones de botón y recepción de bytes UART) llaman a funciones en button_handler.c y/o escriben bytes en los ring buffers de ring_buffer.c.
+
+En el bucle principal de main.c, se revisan los buffers y se llama a la máquina de estados de command_handler.c, que interpreta comandos de 3 caracteres (por ejemplo, #0#, #C#).
+
+Según el comando, se invoca la función correspondiente en door_controller.c para abrir o cerrar la puerta (control de LD4).
+
+button_handler.c se encarga de la lógica de pulsaciones (simple/doble) para B1 y de la actualización de la pantalla OLED al pulsar B2 (timbre).
+
+## Diagrama 2: Flujo Detallado de Comandos
+```plaintext
+┌─────────────────────────────────────────────────────────┐
+│   Interrupción UART2/UART3 o Keypad (HAL_UART_RxCplt,     │
+│   EXTI para keypad). Se recibe un byte.                  │
+└─────────────────────────────────────────────────────────┘
+                │
+                │ (Se almacena el byte en el buffer circular)
+                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                        ring_buffer.c                          │
+│   - Se gestionan tres buffers: UART2, UART3 y Keypad.         │
+│   - El byte se encola en la rutina de interrupción.           │
+└───────────────────────────────────────────────────────────────┘
+                │
+                │ (main.c lee estos buffers en el bucle principal)
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     command_handler.c                           │
+│  - Máquina de estados:                                          │
+│      1) STATE_WAIT_FOR_START (espera "#*#")                     │
+│      2) STATE_WAIT_FOR_COMMAND (interpreta "#0#", "#C#", etc.)   │
+│  - Si se detecta un comando válido, se llama a                   │
+│    door_controller.c para abrir o cerrar la puerta.           │
+│  - Si es inválido, se incrementa el contador de errores y,       │
+│    si se excede el umbral, se activa sleep_mode_mistake().      │
+└─────────────────────────────────────────────────────────────────┘
+                │ (Comando válido: #0#, #C#, #1#, #8#, ...)
+                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                      door_controller.c                         │
+│  - open_door_temp(): activa **LD4** y arranca un temporizador │
+│    de 5 s.                                                      │
+│  - open_door_perm(): activa **LD4** sin temporizador.         │
+│  - close_door(): apaga **LD4**.                                 │
+│  - door_controller_auto_close_check(): verifica si han         │
+│    transcurrido 5 s y cierra la puerta si se trata de una          │
+│    apertura temporal.                                             │
+└───────────────────────────────────────────────────────────────┘
+```
+##Explicación del flujo:
+
+Cuando llega un byte por UART2, UART3 o el teclado (keypad), la rutina de interrupción lo escribe en el ring buffer correspondiente de ring_buffer.c.
+En el bucle principal de main.c, se llama periódicamente a command_handler.c para leer los bytes de cada buffer y trasladarlos a un arreglo de 3 caracteres (current_cmd).
+La máquina de estados en command_handler.c primero busca la secuencia de inicio (#*#). Una vez detectada, pasa a esperar un comando (por ejemplo, #0# para apertura temporal, #C# para cierre, etc.).
+Al reconocer un comando válido, se invoca la función correspondiente en door_controller.c (por ejemplo, open_door_temp()). Si el comando es inválido, se incrementa el contador de errores; tras 5 errores consecutivos, se activa el modo de suspensión (sleep_mode_mistake()).
+En door_controller.c, se enciende o apaga la salida digital (LD4) y, en caso de apertura temporal, se guarda la marca de tiempo para que, transcurridos 5 segundos, la puerta se cierre automáticamente.
 
