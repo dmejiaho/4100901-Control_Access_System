@@ -200,7 +200,7 @@ button_handler.c se encarga de la lógica de pulsaciones (simple/doble) para B1 
 │    apertura temporal.                                             │
 └───────────────────────────────────────────────────────────────┘
 ```
-##Explicación del flujo:
+## Explicación del flujo:
 
 Cuando llega un byte por UART2, UART3 o el teclado (keypad), la rutina de interrupción lo escribe en el ring buffer correspondiente de ring_buffer.c.
 En el bucle principal de main.c, se llama periódicamente a command_handler.c para leer los bytes de cada buffer y trasladarlos a un arreglo de 3 caracteres (current_cmd).
