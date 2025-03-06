@@ -33,7 +33,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define FW_VERSION "0.1.0\r\n"
+#define FW_VERSION "0.2.1\r\n"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,9 +48,10 @@ UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 uint8_t rx_byte;
-
+uint8_t byte_received_uart2;
+uint8_t byte_received_uart3;
 /* --- Global variable for last activity --- */
-uint32_t last_activity_tick;
+uint32_t last_activity_tick = 0;
 
 /* --- Ring buffers for different interfaces --- */
 ring_buffer_t rx_buffer;                // UART2
@@ -89,8 +90,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 
 /* --- UART Receive Callback --- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-  last_activity_tick = HAL_GetTick();  // any UART activity resets inactivity timer
-
+  uint32_t current_tick = HAL_GetTick();  // any UART activity resets inactivity timer
+  last_activity_tick = current_tick;
   if (huart == &huart2) {
     ring_buffer_write(&rx_buffer, rx_byte);
     HAL_UART_Transmit(&huart3, &rx_byte, 1, 10);
@@ -115,6 +116,7 @@ void uart_send_string(const char *str) {
   HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
   HAL_UART_Transmit(&huart3, (uint8_t *)str, strlen(str), 100);
 }
+
 
 /* USER CODE END 0 */
 
@@ -159,12 +161,18 @@ int main(void)
   ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));                     // UART2
   ring_buffer_init(&rx_buffer_uart3, rx_buffer_uart3_mem, sizeof(rx_buffer_uart3_mem));       // UART3
   ring_buffer_init(&rx_buffer_keypad, rx_buffer_keypad_mem, sizeof(rx_buffer_keypad_mem));     // Keypad
-  
+
+  HAL_UART_Receive_IT(&huart2, &byte_received_uart2, 1);
+  HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
+  HAL_UART_Transmit(&huart2, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
+  HAL_UART_Transmit(&huart3, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
+
   memset(current_cmd_uart2, 0, COMMAND_LENGTH);
   memset(current_cmd_uart3, 0, COMMAND_LENGTH);
   memset(current_cmd_keypad, 0, COMMAND_LENGTH);
   
   last_activity_tick = HAL_GetTick();
+  uart_send_string(FW_VERSION);
   /* USER CODE END 2 */
 
   /* Infinite loop */
